@@ -3,11 +3,13 @@ import {
   Property,
   TriggerStrategy,
   tryCatch,
+  Store,
 } from '@activepieces/pieces-framework';
 import { IPublishPacket } from 'mqtt';
 import { mqttAuth, MqttAuthProps } from '../auth';
 import { mqttClient, ReceivedMessage, Subscription } from '../common/client';
 import { mqttPayload } from '../common/payload';
+import { mqttSessionStore } from '../common/session-store';
 import { newMessageOutputSchema } from '../output-schemas';
 
 export const newMessage = createTrigger({
@@ -133,11 +135,11 @@ export const newMessage = createTrigger({
     });
 
     if (context.isRepublish && existing && existing.topic === subscription.topic) {
-      await mqttClient.createPersistentSession({ auth, clientId: existing.clientId, subscription });
+      await mqttClient.createPersistentSession({ auth, clientId: existing.clientId, subscription, store: context.store });
       return;
     }
     if (existing) {
-      await removeSession({ auth, session: existing });
+      await removeSession({ auth, session: existing, store: context.store });
     }
 
     const session: StoredSession = {
@@ -145,7 +147,7 @@ export const newMessage = createTrigger({
       topic: subscription.topic,
     };
     const { error } = await tryCatch(() =>
-      mqttClient.createPersistentSession({ auth, clientId: session.clientId, subscription }),
+      mqttClient.createPersistentSession({ auth, clientId: session.clientId, subscription, store: context.store }),
     );
     if (error) {
       throw new Error(mqttClient.describeError({ error }));
@@ -155,7 +157,7 @@ export const newMessage = createTrigger({
   async onDisable(context) {
     const session = await context.store.get<StoredSession>(SESSION_STORE_KEY);
     if (session) {
-      await removeSession({ auth: context.auth.props, session });
+      await removeSession({ auth: context.auth.props, session, store: context.store });
       await context.store.delete(SESSION_STORE_KEY);
     }
   },
@@ -175,6 +177,7 @@ export const newMessage = createTrigger({
         maxMessages: Math.max(1, propsValue.maxMessagesPerCheck ?? 100),
         listenMs: Math.max(1, propsValue.listenSeconds ?? 5) * 1000,
         accept: (packet) => shouldAccept({ packet, propsValue }),
+        store: context.store,
       }),
     );
     if (error) {
@@ -207,13 +210,16 @@ export const newMessage = createTrigger({
 async function removeSession({
   auth,
   session,
+  store,
 }: {
   auth: MqttAuthProps;
   session: StoredSession;
+  store: Store;
 }): Promise<void> {
   await tryCatch(() =>
     mqttClient.deletePersistentSession({ auth, clientId: session.clientId, topic: session.topic }),
   );
+  await mqttSessionStore.remove({ store, clientId: session.clientId });
 }
 
 function buildSubscription({ propsValue }: { propsValue: SubscriptionProps }): Subscription {

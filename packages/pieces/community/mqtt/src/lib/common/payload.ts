@@ -100,7 +100,11 @@ function toUtf8({ buffer }: { buffer: Buffer }): string | undefined {
 
 function decodeBase64({ value }: { value: string }): Buffer {
   const cleaned = value.replace(/\s+/g, '');
-  if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(cleaned)) {
+  const unpadded = cleaned.replace(/=+$/, '');
+  const padding = cleaned.length - unpadded.length;
+  const remainder = unpadded.length % 4;
+  if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(cleaned) || remainder === 1 ||
+    (padding > 0 && (cleaned.length % 4 !== 0 || padding !== (4 - remainder) % 4))) {
     throw new Error('The payload is not valid Base64.');
   }
   return Buffer.from(cleaned, 'base64');

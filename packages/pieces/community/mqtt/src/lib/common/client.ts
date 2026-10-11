@@ -9,6 +9,8 @@ import {
   MqttClient,
 } from 'mqtt';
 import type { MqttAuthProps } from '../auth';
+import type { Store } from '@activepieces/pieces-framework';
+import { mqttSessionStore, SessionPersistence } from './session-store';
 
 function findConfigurationError({ auth }: { auth: MqttAuthProps }): string | null {
   const usesTls = auth.protocol === 'mqtts' || auth.protocol === 'wss';
@@ -92,6 +94,7 @@ async function receiveMessages({
   maxMessages,
   listenMs,
   accept,
+  store,
 }: {
   auth: MqttAuthProps;
   clientId: string;
@@ -101,7 +104,9 @@ async function receiveMessages({
   maxMessages: number;
   listenMs: number;
   accept: (packet: IPublishPacket) => boolean;
+  store?: Store;
 }): Promise<ReceivedMessage[]> {
+  const persistence = store ? await mqttSessionStore.open({ store, clientId }) : undefined;
   const received: ReceivedMessage[] = [];
   let acknowledged = 0;
   let reachedLimit: (() => void) | undefined;
@@ -113,6 +118,7 @@ async function receiveMessages({
     auth,
     clientId,
     clean,
+    persistence,
     onMessage: ({ topic, packet }) => {
       if (accept(packet)) {
         received.push({ topic, packet, receivedAt: new Date().toISOString() });
@@ -122,6 +128,10 @@ async function receiveMessages({
       }
     },
     customHandleAcks: (_topic, _message, _packet, ack) => {
+      if (_packet.qos === 2 && persistence) {
+        ack(0);
+        return;
+      }
       if (acknowledged >= maxMessages) {
         reachedLimit?.();
         return;
@@ -140,19 +150,22 @@ async function receiveMessages({
   } finally {
     await closeConnection({ client, force: true });
   }
-  return received;
+  return persistence ? persistence.takeMessages({ maxMessages, accept }) : received;
 }
 
 async function createPersistentSession({
   auth,
   clientId,
   subscription,
+  store,
 }: {
   auth: MqttAuthProps;
   clientId: string;
   subscription: Subscription;
+  store: Store;
 }): Promise<void> {
-  const { client } = await openConnection({ auth, clientId, clean: false });
+  const persistence = await mqttSessionStore.open({ store, clientId });
+  const { client } = await openConnection({ auth, clientId, clean: false, persistence });
   try {
     await subscribeTo({ client, subscription });
   } finally {
@@ -243,6 +256,7 @@ function openConnection({
   sessionExpirySeconds,
   onMessage,
   customHandleAcks,
+  persistence,
 }: {
   auth: MqttAuthProps;
   clientId: string;
@@ -250,6 +264,7 @@ function openConnection({
   sessionExpirySeconds?: number;
   onMessage?: (params: { topic: string; packet: IPublishPacket }) => void;
   customHandleAcks?: IClientOptions['customHandleAcks'];
+  persistence?: SessionPersistence;
 }): Promise<OpenConnection> {
   const connectTimeoutMs = (auth.connectTimeoutSeconds ?? 10) * 1000;
   const options = buildClientOptions({
@@ -260,9 +275,25 @@ function openConnection({
     connectTimeoutMs,
     customHandleAcks,
   });
+  options.incomingStore = persistence?.incomingStore;
 
   return new Promise<OpenConnection>((resolve, reject) => {
     const client = connect(options);
+    if (persistence) {
+      persistence.setErrorHandler({ handler: (error) => {
+        client.end(true);
+        client.emit('error', error);
+      } });
+      let messageTopic: string | undefined;
+      client.on('message', (topic) => { messageTopic = topic; });
+      client.handleMessage = (packet, callback) => {
+        void persistence.saveMessage({ packet: { ...packet, topic: messageTopic ?? packet.topic } }).then(() => callback(), (error: unknown) => {
+          const failure = error instanceof Error ? error : new Error(String(error));
+          callback(failure);
+          client.emit('error', failure);
+        });
+      };
+    }
     const timer = setTimeout(() => {
       client.end(true);
       reject(Object.assign(new Error('Connection timed out'), { code: 'CONNECT_TIMEOUT' }));
